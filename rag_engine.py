@@ -1,56 +1,70 @@
 import os
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitters import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("AIzaSyCRNoHYfsfhDtJK9Mp_UB6b_Jrh4NCN7Ok")
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Load embedding model
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-# ---------------------- BUILD VECTOR DB ----------------------
-def build_vector_db(pdf_folder="docs", db_path="vector_store"):
-    documents = []
+def extract_text_from_pdf(pdf_file):
+    reader = PdfReader(pdf_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return text
 
-    for file_name in os.listdir(pdf_folder):
-        if file_name.endswith(".pdf"):
-            loader = PyPDFLoader(os.path.join(pdf_folder, file_name))
-            documents.extend(loader.load())
 
-    text_splitter = RecursiveCharacterTextSplitter(
+def build_vector_db(pdf_file):
+    text = extract_text_from_pdf(pdf_file)
+
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
-        chunk_overlap=150
+        chunk_overlap=100
     )
-    chunks = text_splitter.split_documents(documents)
 
-    embeddings = OpenAIEmbeddings()
+    chunks = splitter.split_text(text)
 
-    vector_db = FAISS.from_documents(chunks, embeddings)
-    vector_db.save_local(db_path)
+    embeddings = embedder.encode(chunks)
 
-    return vector_db
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+
+    return index, chunks
 
 
-# ---------------------- QUERY ENGINE ----------------------
-def answer_query(query, db_path="vector_store"):
-    embeddings = OpenAIEmbeddings()
-    vector_db = FAISS.load_local(db_path, embeddings, allow_dangerous_deserialization=True)
+def search_chunks(query, index, chunks, top_k=5):
+    q_embed = embedder.encode([query])
+    distances, indices = index.search(q_embed, top_k)
 
-    retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+    results = [chunks[i] for i in indices[0]]
+    return results
 
-    docs = retriever.get_relevant_documents(query)
 
-    context = "\n\n".join([d.page_content for d in docs])
+def answer_query(query, index, chunks):
+    context = "\n\n".join(search_chunks(query, index, chunks))
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    model = genai.GenerativeModel("models")
 
     prompt = f"""
-    You are an expert assistant. Use ONLY the following context to answer.
-    If context does not include the answer, say "Not found in documents."
+You are an expert assistant. Use ONLY the following context:
 
-    Context:
-    {context}
+{context}
 
-    Question: {query}
-    """
+Question: {query}
 
-    response = llm.invoke(prompt)
+Answer:
+"""
 
-    return response.content
+    response = model.generate_content(prompt)
+    return response.text
